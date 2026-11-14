@@ -226,6 +226,12 @@ scope 用 crate 短名：`server` / `session` / `desktop` / `poc` / `docs` / `to
   写的断言（「没有 404.html 所以我走内联分支」）会在换前端时静默失效。
 - **Tailwind v4 会扫整个前端目录**用来自动收集 class，所以 `frontend/` 下
   不要放无关的大目录；也只搬被引用到的文件会让 CSS 缺类（实测缺 74 个）。
+- **发布版的 WebView 原生右键菜单是主动关掉的**（`toiler-desktop/src/lib.rs` 的
+  `SUPPRESS_CONTEXT_MENU_SCRIPT`，只在 `not(debug_assertions)` 注入）。三条约束：
+  监听必须挂在**捕获阶段**（前端 React 处理器注册得更晚）；只 `preventDefault`，
+  **不能 `stopPropagation`**（会话列表行的自定义右键菜单靠冒泡派发）；脚本里
+  **不能出现 `//`**（与导出页同一条铁律，压平后会吃掉后续代码）。输入框 /
+  contenteditable 与 `.xterm` 必须放行，否则终端只剩快捷键盘能粘贴。
 
 ## 明确不做的事
 

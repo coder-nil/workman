@@ -970,6 +970,14 @@ pub fn defer_media_blocks(message: &Value) -> Value {
 pub fn context_view(entries: &[Value], leaf_id: Option<&str>) -> ContextView {
     let branch = branch_entries(entries, leaf_id);
     let mut view = ContextView::default();
+    // 分支上没有 `model_change` 时的兜底：最后一条 assistant 消息自带的
+    // `provider` / `model`。
+    //
+    // pi 早期版本（以及个别新建路径）不写 `model_change` 条目，只把模型记在
+    // 每条 assistant 消息里。只认 `model_change` 的话这类会话的 `context.model`
+    // 恒为 null，前端输入框的模型按钮就退化成文案「选择模型」——用户看到的是
+    // 「模型名偶尔丢失」。这与 `boot.rs::last_used_model` 的回退顺序一致。
+    let mut assistant_model: Option<Value> = None;
     for entry in &branch {
         match entry.get("type").and_then(Value::as_str) {
             Some("model_change") => {
@@ -982,6 +990,11 @@ pub fn context_view(entries: &[Value], leaf_id: Option<&str>) -> ContextView {
                     view.thinking_level = level.clone();
                 }
             }
+            Some("message") => {
+                if let Some(found) = assistant_message_model(entry) {
+                    assistant_model = Some(found);
+                }
+            }
             _ => {}
         }
         if let Some(message) = context_entry_message(entry) {
@@ -991,7 +1004,31 @@ pub fn context_view(entries: &[Value], leaf_id: Option<&str>) -> ContextView {
             view.messages.push(message);
         }
     }
+    if view.model.is_null() {
+        if let Some(found) = assistant_model {
+            view.model = found;
+        }
+    }
     view
+}
+
+/// 从一条 assistant 消息里取 `{provider, modelId}`（v3 原文的字段是 `model`，
+/// 不是 `modelId`；已归一化的形状两个都认）。非 assistant / 缺字段返回 None。
+fn assistant_message_model(entry: &Value) -> Option<Value> {
+    let message = entry.get("message")?;
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let provider = message
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    let model_id = message
+        .get("model")
+        .or_else(|| message.get("modelId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    Some(json!({ "provider": provider, "modelId": model_id }))
 }
 
 /// 会话当前的叶子 id（最后一条带 id 的条目）。
@@ -1166,6 +1203,54 @@ mod context_tests {
         assert_eq!(view.entry_ids, vec!["u"]);
         assert_eq!(view.model["provider"], "qoder");
         assert_eq!(view.thinking_level, "high");
+    }
+
+    /// 没有 `model_change` 条目时用最后一条 assistant 消息的 `provider`/`model` 兜底。
+    ///
+    /// pi 早期会话（以及个别新建路径）不写 `model_change`，只把模型记在 assistant
+    /// 消息里。只认 `model_change` 的话 `context.model` 恒为 null，前端输入框的
+    /// 模型按钮退化成文案「选择模型」——用户看到的就是「模型名偶尔丢失」。
+    #[test]
+    fn context_view_falls_back_to_assistant_message_model() {
+        let mut first = entry("a1", None, "message");
+        first["message"] = json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "provider": "local",
+            "model": "deepseek-flash",
+        });
+        let mut second = entry("a2", Some("a1"), "message");
+        second["message"] = json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "again"}],
+            "provider": "apisets",
+            "model": "glm-5.3",
+        });
+
+        let view = context_view(&[first, second], None);
+        // 取最后一条：切过模型的旧会话也应该回显当前的
+        assert_eq!(view.model["provider"], "apisets");
+        assert_eq!(view.model["modelId"], "glm-5.3");
+    }
+
+    /// `model_change` 存在时以它为准，assistant 消息不得把它覆盖掉。
+    #[test]
+    fn context_view_prefers_model_change_over_assistant() {
+        let mut change = entry("m", None, "model_change");
+        change["provider"] = json!("qoder");
+        change["modelId"] = json!("GLM-5.3");
+        let mut message = entry("a", Some("m"), "message");
+        message["message"] = json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            // 用户刚切了模型、还没发消息时，旧 assistant 消息记的是老模型
+            "provider": "local",
+            "model": "deepseek-flash",
+        });
+
+        let view = context_view(&[change, message], None);
+        assert_eq!(view.model["provider"], "qoder");
+        assert_eq!(view.model["modelId"], "GLM-5.3");
     }
 
     /// `deferMedia` 必须真的把图片块换掉：前端首屏一直带这条参数，不生效的话

@@ -371,7 +371,7 @@ pi 另有三个写侧/市场接口，toiler 都返回 `501 {"error":"…中文�
 | `GET /api/agent/{id}/bash-output` | ✅ | `?path=&download=1`；5 MiB 上限（413）、越权 403、`pi-bash-*.log` 白名单 |
 | `GET /api/agent/running/events` | ✅ | SSE：首帧快照 + 变化即推 + 30s 心跳 |
 | `GET /api/sessions/{id}/context` | ✅ | `{context,paging}`，形状同 detail 的 `context` |
-| `GET /api/sessions/{id}/export` | ⚠️ | 单文件 HTML（header/文件名规则同 pi）；内容是自己渲染的转写稿：左侧大纲 + 系统提示词分节 + 按轮次分组 + markdown 渲染 + 工具/思考折叠；`?theme=light\|dark` 控制深浅色，见差异 12 |
+| `GET /api/sessions/{id}/export` | ⚠️ | 单文件 HTML（header/文件名规则同 pi）；内容是自己渲染的转写稿：左侧大纲 + 系统提示词分节 + 按轮次分组 + markdown 渲染 + 工具调用与结果按 id 合并成一个折叠块 + 思考折叠；`?theme=light\|dark` 控制深浅色，见差异 12 |
 | `GET /api/sessions/{id}/entries/{entryId}/thinking` | ✅ | `?blockIndex=N` → `{thinking}` |
 | `POST /api/sessions/{id}/auto-name` | ✅ | 用会话自己的模型起标题，写回 `session_info` → `{title,usage}` |
 | `GET /api/auth/providers` | ✅ | **OAuth / 订阅**列表：`{id,name,baseUrl?,usesCallbackServer,loggedIn,supportsApiKey}`，11 家（含 `qoder-cn`，见差异 6） |
@@ -501,9 +501,13 @@ pi 另有三个写侧/市场接口，toiler 都返回 `501 {"error":"…中文�
     - **按用户提问切轮次**：每条提问开一个 `<section class="turn" id="turn-N">`，
       它后面的助手正文与该轮工具调用都归进这一轮。第一条提问之前的内容归 `turn-0`
       （没有就不出现）。真实会话里工具输出占 76%，平铺会把主线淹掉。
-    - **工具调用 / 工具输出 / 思考各占一行折叠条**（`<details class="tool">` /
-      `class="thinking"`，默认收起），摘要带真实工具名与首行参数/输出；工具输出
-      正文超过 4000 字会截断并提示原文长度。
+    - **工具调用与它的结果合成一个折叠条**（`<details class="tool">`，默认收起）：
+      v3 里「调用」和「结果」是**两条独立消息**，只靠 `toolCall.id` ↔
+      `toolResult.toolCallId` 关联，所以渲染前先按 id 配对（`collect_tool_results`），
+      调用块里固定两段「参数」与「结果」，摘要行带真实工具名、首行参数、结果行数与
+      失败标记；没配上结果时明说一句而不是只剩参数。配对键要同时认 `id`（v3 原文）
+      与 `toolCallId`（`context_view` 归一化后），只认一个会整页变成「没有记录到结果」。
+      思考单独一个折叠条（`class="thinking"`）。折叠正文超过 4000 字会截断并提示原文长度。
     - **正文走 markdown 渲染**（`pulldown-cmark`：表格 / 删除线 / 任务列表），
       不再是转义后的纯文本（那会让 `\n\n` 被 HTML 折成空格、列表与围栏全部失效）。
     - **左侧常驻大纲**（`.outline`，260px 粘滞在左边）：首项是「系统提示词」，

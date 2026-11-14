@@ -322,6 +322,9 @@ struct Strings {
     thinking: &'static str,
     tool_error: &'static str,
     arguments: &'static str,
+    result: &'static str,
+    result_missing: &'static str,
+    result_lines: &'static str,
     output_empty: &'static str,
     truncated: &'static str,
     outline: &'static str,
@@ -356,6 +359,9 @@ const STRINGS_ZH: Strings = Strings {
     thinking: "思考",
     tool_error: "失败",
     arguments: "参数",
+    result: "结果",
+    result_missing: "没有记录到结果",
+    result_lines: "{n} 行",
     output_empty: "（无输出）",
     truncated: "\n\n··· （已截断：只保留前 {kept} 字，原文共 {total} 字）",
     outline: "会话目录",
@@ -390,6 +396,9 @@ const STRINGS_EN: Strings = Strings {
     thinking: "Thinking",
     tool_error: "failed",
     arguments: "Arguments",
+    result: "Result",
+    result_missing: "no result recorded",
+    result_lines: "{n} lines",
     output_empty: "(no output)",
     truncated: "\n\n··· (truncated: kept first {kept} of {total} chars)",
     outline: "Contents",
@@ -774,6 +783,19 @@ details.tool{background:transparent;border:none;border-left:2px solid var(--line
 border-radius:0 7px 7px 0;padding-left:2px}
 details.tool[open]{background:var(--soft);border-left-color:var(--tool-line)}
 details.tool.is-error{border-left-color:var(--err)}
+/* 摘要右侧的「N 行」：告诉你这个块里有多少输出，不用展开就知道该不该点。 */
+summary .tool-count{flex:none;color:var(--dim);font-size:11px;
+font-variant-numeric:tabular-nums}
+/* 工具块展开后分「参数 / 结果」两段：每段一个小区块标题 + 代码块，
+   两段之间用一条极淡分隔线断开，避免参数和输出糊成一片。 */
+.tool-part{padding:0 0 2px}
+.tool-part+.tool-part{border-top:1px solid var(--line-soft)
+}
+.tool-part h4{margin:0;padding:8px 14px 0;font-size:10.5px;font-weight:700;
+text-transform:uppercase;letter-spacing:.09em;color:var(--dim)}
+.tool-part pre{border-radius:0 0 7px 7px}
+.tool-part.is-missing p{margin:0;padding:5px 14px 10px;font-size:12px;
+color:var(--dim);font-style:italic}
 details.prompt-section{background:var(--panel);border:1px solid var(--line)}
 details.prompt-section{box-shadow:var(--shadow);margin:8px 0}
 details.prompt-section[open]{border-color:var(--accent)}
@@ -989,18 +1011,24 @@ fn pre(text: &str) -> String {
 /// 把一条消息渲染成「正文 + 折叠区」两段。
 ///
 /// 正文（`main`）进主线，工具与思考进 `aside`（默认折起）。
-fn render_message(message: &Value, s: Strings) -> (String, String) {
+fn render_message(
+    message: &Value,
+    results: &HashMap<String, ToolOutcome>,
+    s: Strings,
+) -> (String, String) {
     let content = message.get("content");
     let kind = kind_of(message);
     let mut main = String::new();
     let mut aside = String::new();
 
+    // `toolResult` 的内容已经被对应的 toolCall 块接管（见 `tool_call_block`），
+    // 这里不能再渲染一遍，否则一次调用会出现「调用 + 结果」两条重复的折叠条。
+    if kind == Kind::Tool {
+        return (String::new(), String::new());
+    }
+
     // 字符串形态的 content（compaction 摘要等）。
     if let Some(text) = content.and_then(Value::as_str) {
-        // toolResult 的 content 也可能是字符串，同样只能进折叠区。
-        if kind == Kind::Tool {
-            return (String::new(), tool_result_aside(message, text, s));
-        }
         return (render_markdown(text), String::new());
     }
 
@@ -1033,27 +1061,9 @@ fn render_message(message: &Value, s: Strings) -> (String, String) {
                 }
             }
             Some("toolCall") => {
-                let (name, args) = tool_name_and_args(block);
-                let hint = truncate_chars(&args_one_line(args.as_ref()), 90);
-                // 徽章只放方向箭头（`→` 调用 / `←` 返回），工具名放在后面，
-                // 别再重复一遍——之前把名字也塞进 badge，渲染成「bash← bash」。
-                let summary = format!(
-                    "<span class=\"badge\">\u{2192}</span><span class=\"tool-name\">{}</span>\
-<span class=\"tool-hint\">{}</span>",
-                    escape_html(&name),
-                    escape_html(&hint)
-                );
-                let body = match args.as_ref().and_then(|value| value.as_object()) {
-                    Some(_) => {
-                        let pretty = args
-                            .as_ref()
-                            .and_then(|value| serde_json::to_string_pretty(value).ok())
-                            .unwrap_or_default();
-                        format!("<h4>{}</h4>{}", s.arguments, pre(&clamp_block(&pretty, s)))
-                    }
-                    None => String::new(),
-                };
-                aside.push_str(&details_block("tool", &summary, &body, false));
+                if let Some(block_html) = tool_call_block(block, results, s) {
+                    aside.push_str(&block_html);
+                }
             }
             Some("image") => {
                 main.push_str(&format!("<p class=\"media\">{}</p>", escape_html(s.image)));
@@ -1062,51 +1072,142 @@ fn render_message(message: &Value, s: Strings) -> (String, String) {
         }
     }
 
-    // toolResult：整块进折叠区，摘要带上工具名与首行输出。
-    if kind == Kind::Tool {
-        aside.push_str(&tool_result_aside(message, &blocks_plain_text(content), s));
-    }
-
     (main, aside)
 }
 
-/// 一条 `toolResult` 的折叠块（工具名 + 首行摘要 + 输出正文）。
-fn tool_result_aside(message: &Value, text: &str, s: Strings) -> String {
-    let name = message
-        .get("toolName")
-        .and_then(Value::as_str)
-        .unwrap_or("tool");
-    let failed = message
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let first_line = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("");
+/// 一条工具调用结果（按 `toolCallId` 与调用配对后剩下的部分）。
+struct ToolOutcome {
+    text: String,
+    failed: bool,
+}
+
+/// 按 `toolCall.id` 收集所有工具结果。
+///
+/// v3 文件里**调用与结果是两条独立的消息**：调用在 assistant 的
+/// `content[].toolCall` 里，结果是一条单独的 `role:"toolResult"` 消息，
+/// 二者只靠 `toolCall.id` ↔ `toolResult.toolCallId` 关联。原先两边各自渲染
+/// 成一条折叠条、靠相邻摆放暗示关系，一旦中间夹了别的消息关系就断了。
+/// 现在先把结果收成表，渲染调用时一次取走。
+fn collect_tool_results(messages: &[Value]) -> HashMap<String, ToolOutcome> {
+    let mut map: HashMap<String, ToolOutcome> = HashMap::new();
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("toolResult") {
+            continue;
+        }
+        let Some(call_id) = message.get("toolCallId").and_then(Value::as_str) else {
+            continue;
+        };
+        let text = match message.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            _ => blocks_plain_text(message.get("content")),
+        };
+        map.insert(
+            call_id.to_string(),
+            ToolOutcome {
+                text,
+                failed: message
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
+        );
+    }
+    map
+}
+
+/// 一次工具调用 + 它的结果，合成**一个**折叠块。
+///
+/// 结构：摘要行（`→ 工具名 首行参数` + 结果行数 + 失败标记），展开后是两段
+/// 「参数」与「结果」。没配上结果时明说一句，而不是默默只剩参数。
+fn tool_call_block(
+    block: &Value,
+    results: &HashMap<String, ToolOutcome>,
+    s: Strings,
+) -> Option<String> {
+    let (name, args) = tool_name_and_args(block);
+    // 配对键：`context_view` 会把 `toolCall` 归一化成 `toolCallId`，而 v3 原文是 `id`。
+    // 两个都认，否则归一化后一律配对失败（渲染成满屏「没有记录到结果」）。
+    let call_id = block
+        .get("toolCallId")
+        .or_else(|| block.get("id"))
+        .and_then(Value::as_str);
+    let outcome = call_id.and_then(|id| results.get(id));
+    let failed = outcome.map(|o| o.failed).unwrap_or(false);
+
+    let hint = truncate_chars(&args_one_line(args.as_ref()), 90);
+    // 徽章只放方向箭头（`→` 调用）：工具名已经紧跟在后，别重复一遍。
     let mut summary = format!(
-        "<span class=\"badge\">\u{2190}</span><span class=\"tool-name\">{}</span>\
+        "<span class=\"badge\">\u{2192}</span><span class=\"tool-name\">{}</span>\
 <span class=\"tool-hint\">{}</span>",
-        escape_html(name),
-        escape_html(&truncate_chars(first_line, 90))
+        escape_html(&name),
+        escape_html(&hint)
     );
+    if let Some(outcome) = outcome {
+        let lines = outcome
+            .text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        if lines > 0 {
+            summary.push_str(&format!(
+                "<span class=\"tool-count\">{}</span>",
+                escape_html(&s.result_lines.replace("{n}", &lines.to_string()))
+            ));
+        }
+    }
     if failed {
         summary.push_str(&format!(
             "<span class=\"tool-error\">{}</span>",
             escape_html(s.tool_error)
         ));
     }
-    let body = if text.trim().is_empty() {
-        pre(s.output_empty)
-    } else {
-        pre(&clamp_block(text, s))
+
+    // 参数段：只有真的是对象/字符串时才占一段，空参数不渲染空标题。
+    let args_html = match args.as_ref() {
+        Some(value) if value.is_object() || value.is_string() => {
+            let pretty = if let Some(text) = value.as_str() {
+                text.to_string()
+            } else {
+                serde_json::to_string_pretty(value).unwrap_or_default()
+            };
+            if pretty.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<div class=\"tool-part\"><h4>{}</h4>{}</div>",
+                    escape_html(s.arguments),
+                    pre(&clamp_block(&pretty, s))
+                )
+            }
+        }
+        _ => String::new(),
     };
-    details_block(
+
+    // 结果段：配上就渲染输出（空输出也保留一段说明），没配上就明说。
+    let result_html = match outcome {
+        Some(outcome) if outcome.text.trim().is_empty() => format!(
+            "<div class=\"tool-part\"><h4>{}</h4>{}</div>",
+            escape_html(s.result),
+            pre(s.output_empty)
+        ),
+        Some(outcome) => format!(
+            "<div class=\"tool-part\"><h4>{}</h4>{}</div>",
+            escape_html(s.result),
+            pre(&clamp_block(&outcome.text, s))
+        ),
+        None => format!(
+            "<div class=\"tool-part is-missing\"><h4>{}</h4><p>{}</p></div>",
+            escape_html(s.result),
+            escape_html(s.result_missing)
+        ),
+    };
+
+    Some(details_block(
         if failed { "tool is-error" } else { "tool" },
         &summary,
-        &body,
+        &format!("{args_html}{result_html}"),
         false,
-    )
+    ))
 }
 
 /// 一条消息的头部（角色 + 时间）。
@@ -1332,6 +1433,10 @@ fn render_export_html(
     // 编号规则：第一条提问之前的零散内容归一个前导段（`turn-0`），
     // 之后的每个提问各占一轮（`turn-1`、`turn-2`…）。编号必须按实际轮次
     // 分配，不能拿 `turns.len()+1` 算——那样前导段会把编号顶错。
+    // 工具结果先一次性配对好：v3 里调用与结果是两条独立消息，只靠
+    // `toolCall.id` ↔ `toolResult.toolCallId` 关联，不先配对就只能靠相邻摆放暗示关系。
+    let tool_results = collect_tool_results(&view.messages);
+
     let mut turns: Vec<Turn> = Vec::new();
     let mut preamble_done = false;
     let mut round = 0usize;
@@ -1380,17 +1485,14 @@ fn render_export_html(
             // 静默：前导段之后、第一条提问之前的内容仍然属于 `turn-0`。
         }
 
-        let (main, aside) = render_message(message, s);
-        let turn = turns.last_mut().expect("至少一轮");
-        // toolResult 不单占一块：它的折叠条已经带着工具名与首行输出，
-        // 再包一层「Tool 15:17:11」只会把主线撑成一堆重复头部。直接拼进
-        // 上一个 assistant 块的折叠区，读起来就是「那个回答调了什么」。
+        // toolResult 的内容已经并进对应 toolCall 的折叠块，这里整条跳过：
+        // 既不再单占一块，也不会顶一行「Tool 时间」把主线撑开。
         if kind == Kind::Tool {
-            if !aside.is_empty() {
-                turn.body.push_str(&aside);
-            }
             continue;
         }
+
+        let (main, aside) = render_message(message, &tool_results, s);
+        let turn = turns.last_mut().expect("至少一轮");
         if !main.is_empty() || !aside.is_empty() {
             turn.body.push_str(&format!(
                 "<article class=\"msg {class}\">{head}<div class=\"main\">{main}</div>\

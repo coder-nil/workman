@@ -1472,6 +1472,98 @@ async fn sessions_export_page_keeps_the_mainline_readable() {
 }
 
 #[tokio::test]
+async fn sessions_export_page_pairs_each_tool_call_with_its_result() {
+    // 结构问题：v3 文件里「工具调用」和「工具结果」是**两条独立的消息**，
+    // 调用在 assistant 的 `content[].toolCall` 里，结果是一条单独的
+    // `role:"toolResult"`，二者只靠 `toolCall.id` ↔ `toolResult.toolCallId`
+    // 关联。原先两边各渲染一条折叠条、靠相邻摆放暗示关系，于是同一次调用
+    // 在页面上出现两次，中间一旦夹了别的消息关系就断了。
+    //
+    // 这条用例锁住「按 id 配成一个块」，以及三种边界：正常输出、失败、
+    // 没有结果。同时锁住配对键的两个名字（`id` 原文 / `toolCallId` 归一化后）。
+    let root = fixture_root("sessexportpair");
+    write_session(
+        &root,
+        &[
+            r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-11-10T06:41:45.000Z","message":{"role":"user","content":[{"type":"text","text":"看下代码"}],"timestamp":1794292905000}}"#,
+            // 一条 assistant 同时发三个调用：v3 原始形状 `id`/`name`/`arguments`。
+            r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-11-10T06:41:46.000Z","message":{"role":"assistant","content":[{"type":"text","text":"我先查一下。"},{"type":"toolCall","id":"call_ok","name":"read","arguments":{"filePath":"/tmp/demo/a.rs"}},{"type":"toolCall","id":"call_bad","name":"bash","arguments":{"command":"cargo test"}},{"type":"toolCall","id":"call_lost","name":"grep","arguments":{"pattern":"foo"}}],"timestamp":1794292906000}}"#,
+            r#"{"type":"message","id":"t1","parentId":"a1","timestamp":"2026-11-10T06:41:47.000Z","message":{"role":"toolResult","toolCallId":"call_ok","toolName":"read","isError":false,"content":[{"type":"text","text":"第一行输出\n第二行输出\n第三行输出"}],"timestamp":1794292907000}}"#,
+            r#"{"type":"message","id":"t2","parentId":"t1","timestamp":"2026-11-10T06:41:48.000Z","message":{"role":"toolResult","toolCallId":"call_bad","toolName":"bash","isError":true,"content":[{"type":"text","text":"error: test failed"}],"timestamp":1794292908000}}"#,
+            // call_lost 故意没有对应的结果消息。
+            r#"{"type":"message","id":"a2","parentId":"t2","timestamp":"2026-11-10T06:41:49.000Z","message":{"role":"assistant","content":[{"type":"text","text":"查完了。"}],"timestamp":1794292909000}}"#,
+        ],
+    );
+    let html = get(
+        app(&root, Path::new("/tmp/demo")),
+        "/api/sessions/sess-a/export?inline=1&lang=zh-CN",
+    )
+    .await
+    .text();
+    // 只去掉 `<style>` 块再断言：样式表里有 `.tool-part` 这类选择器，
+    // 不剔除会让「出现几次」的计数把 CSS 也算进去。
+    let body = {
+        let mut out = String::new();
+        let mut rest: &str = &html;
+        while let Some(start) = rest.find("<style>") {
+            out.push_str(&rest[..start]);
+            match rest[start..].find("</style>") {
+                Some(end) => rest = &rest[start + end + "</style>".len()..],
+                None => break,
+            }
+        }
+        out.push_str(rest);
+        out
+    };
+
+    // 1) 三次调用 → 三个折叠块，不是一个调用 + 一个结果各占一块（那会是 5 个）。
+    let blocks: Vec<&str> = body
+        .match_indices("<details class=\"tool")
+        .map(|(i, _)| &body[i..])
+        .collect();
+    assert_eq!(blocks.len(), 3, "每个调用与它的结果应合成一个块：{body}");
+
+    // 2) 每块都带「参数」与「结果」两段（结构统一，不因有没有结果而变形）。
+    let part_count = body.matches("<div class=\"tool-part").count();
+    assert_eq!(part_count, 6, "三个块各两段：{body}");
+
+    // 3) 正常结果：输出进了块的「结果」段，并给出行数。
+    assert!(body.contains("第三行输出"), "结果正文丢了：{body}");
+    assert!(
+        body.contains("<span class=\"tool-count\">3 行</span>"),
+        "结果行数没标：{body}"
+    );
+
+    // 4) 失败结果：块带 is-error，摘要上有「失败」，且输出仍在。
+    assert!(
+        body.contains("class=\"tool is-error\""),
+        "失败态没标：{body}"
+    );
+    assert!(
+        body.contains("<span class=\"tool-error\">失败</span>"),
+        "失败标记没渲染：{body}"
+    );
+    assert!(body.contains("error: test failed"), "失败输出丢了：{body}");
+
+    // 5) 没有结果：明说一句，而不是默默只剩参数。
+    assert!(body.contains("没有记录到结果"), "缺结果时应明说：{body}");
+
+    // 6) 工具输出不能漏进主线（main 里只该有回答的 markdown）。
+    let mains: Vec<&str> = body
+        .split("<div class=\"main\">")
+        .skip(1)
+        .filter_map(|chunk| chunk.split("</div>").next())
+        .collect();
+    let mainline = mains.join("\n");
+    assert!(
+        !mainline.contains("error: test failed") && !mainline.contains("第一行输出"),
+        "工具输出漏进了主线：{mainline}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
 async fn sessions_export_page_shows_system_prompt_and_left_outline() {
     // 系统提示词存在 `message.sections` 里（`content` 是空串）。同一分支上
     // 会有多条（切工具 / 换模型重发），后面的是**增量**：实测一份真实会话
@@ -4699,4 +4791,35 @@ async fn edit_from_here_hides_target_and_everything_after_it() {
     }
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&agent_dir).ok();
+}
+
+/// 会话文件里**没有** `model_change` 条目时，`context.model` 仍要回显模型。
+///
+/// pi 早期会话（以及个别新建路径）只把模型记在每条 assistant 消息的
+/// `provider`/`model` 上，不写 `model_change`。只认 `model_change` 的话
+/// `context.model` 恒为 null，前端 `ChatInput` 的模型按钮就退化成文案
+/// 「选择模型」—— 用户报的就是「模型名偶尔丢失」。用户本机 113 个会话里
+/// 有 4 个是这种形状（实测）。
+#[tokio::test]
+async fn context_model_falls_back_to_assistant_message() {
+    let root = fixture_root("model-fallback");
+    let agent_dir = fixture_root("model-fallback-agent");
+    write_session(
+        &root,
+        &[
+            r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-11-10T06:41:45.000Z","message":{"role":"user","content":[{"type":"text","text":"你好"}],"timestamp":1794292905000}}"#,
+            r#"{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-11-10T06:41:46.000Z","message":{"role":"assistant","content":[{"type":"text","text":"在"}],"api":"openai-completions","provider":"local","model":"deepseek-flash","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1794292906000}}"#,
+        ],
+    );
+    let router = app_with_two_models(&root, Path::new("/tmp/demo"), &agent_dir);
+
+    let session = get(router, "/api/sessions/sess-a").await.json();
+    assert_eq!(
+        session["context"]["model"]["provider"], "local",
+        "没有 model_change 时要用 assistant 消息兜底：{session}"
+    );
+    assert_eq!(
+        session["context"]["model"]["modelId"], "deepseek-flash",
+        "{session}"
+    );
 }
