@@ -1,6 +1,6 @@
 [package]
 name = "toiler-server"
-version = "1.0.0"
+version = "1.0.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -52,6 +52,7 @@ flate2 = "1"
 idna = "1"
 # 枚举本机网卡，挑一个手机最可能连上的内网 IPv4（pi 用 os.networkInterfaces）
 libc = "0.2"
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }

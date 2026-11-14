@@ -371,7 +371,7 @@ pi 另有三个写侧/市场接口，toiler 都返回 `501 {"error":"…中文�
 | `GET /api/agent/{id}/bash-output` | ✅ | `?path=&download=1`；5 MiB 上限（413）、越权 403、`pi-bash-*.log` 白名单 |
 | `GET /api/agent/running/events` | ✅ | SSE：首帧快照 + 变化即推 + 30s 心跳 |
 | `GET /api/sessions/{id}/context` | ✅ | `{context,paging}`，形状同 detail 的 `context` |
-| `GET /api/sessions/{id}/export` | ⚠️ | 单文件 HTML 下载（header/文件名规则同 pi，内容是线性转写稿，不是 pi 的树状视图） |
+| `GET /api/sessions/{id}/export` | ⚠️ | 单文件 HTML（header/文件名规则同 pi）；内容是自己渲染的转写稿：左侧大纲 + 系统提示词分节 + 按轮次分组 + markdown 渲染 + 工具/思考折叠；`?theme=light\|dark` 控制深浅色，见差异 12 |
 | `GET /api/sessions/{id}/entries/{entryId}/thinking` | ✅ | `?blockIndex=N` → `{thinking}` |
 | `POST /api/sessions/{id}/auto-name` | ✅ | 用会话自己的模型起标题，写回 `session_info` → `{title,usage}` |
 | `GET /api/auth/providers` | ✅ | **OAuth / 订阅**列表：`{id,name,baseUrl?,usesCallbackServer,loggedIn,supportsApiKey}`，11 家（含 `qoder-cn`，见差异 6） |
@@ -495,8 +495,53 @@ pi 另有三个写侧/市场接口，toiler 都返回 `501 {"error":"…中文�
 11. **`/api/git/commit-message` 的流**：pi 每收到一段就发一行 `update`；toiler 攒完再一次
     `update` + `done`（字段相同，少了中间增量）。
 12. **`/api/sessions/{id}/export` 的 HTML**：响应头与文件名规则与 pi 一致，但内容是自己渲染的
-    线性转写稿（pi 用 `pi` CLI 生成带树状导航的 HTML）。`?inline=1` / `?desktop=1` / `returnTo`
-    都支持。
+    转写稿（pi 用 `pi` CLI 生成带树状导航的 HTML）。`?inline=1` / `?desktop=1` / `returnTo`
+    都支持。另外 toiler 多一个 `?lang=zh-CN|en`（影响导出页自己的文案与 `<html lang>`）。
+    页面结构与 pi 不同，按「可扫读」重排：
+    - **按用户提问切轮次**：每条提问开一个 `<section class="turn" id="turn-N">`，
+      它后面的助手正文与该轮工具调用都归进这一轮。第一条提问之前的内容归 `turn-0`
+      （没有就不出现）。真实会话里工具输出占 76%，平铺会把主线淹掉。
+    - **工具调用 / 工具输出 / 思考各占一行折叠条**（`<details class="tool">` /
+      `class="thinking"`，默认收起），摘要带真实工具名与首行参数/输出；工具输出
+      正文超过 4000 字会截断并提示原文长度。
+    - **正文走 markdown 渲染**（`pulldown-cmark`：表格 / 删除线 / 任务列表），
+      不再是转义后的纯文本（那会让 `\n\n` 被 HTML 折成空格、列表与围栏全部失效）。
+    - **左侧常驻大纲**（`.outline`，260px 粘滞在左边）：首项是「系统提示词」，
+      后面每轮一项（提问首行 + 时间 + 轮次号）。窄屏（≤1000px）改成顶部横向
+      滚动的胶囊列表，不再占侧边宽度。
+    - **系统提示词面板**：v3 文件把它存在 `message.sections` 里（`content` 是空串）。
+      同一分支上会有**多条**（切工具 / 换模型时重发），后面的是**增量**——实测
+      一份会话后两条只带 `tools`+`rules`，`project_context`（8 KB）只在第一条里。
+      所以按分支顺序**合并**、同名分节以后者为准，不能只取最后一条。分节按
+      `preamble → tools → rules → project_instructions → project_context → skills
+      → docs → cwd → env` 排列，每个分节一张可折叠卡片（首个展开），纯文本
+      原样展示（不跑 markdown：这里要看的是实际发出去的字节）。
+    - 每条消息带 `timestamp` 的 `HH:MM:SS`（UTC）。
+    - 工具字段**两种形状都认**：`{toolName,input}`（`normalize_tool_calls` 归一化后的）
+      与 `{name,arguments}`（v3 文件原始形状）。只读后者会全部渲染成「🔧 tool」+ `null`。
+
+    `?inline=1` 或 `?desktop=1`（页面被展示而不是下载）时额外注入一个常驻的
+    「返回对话」按钮 + 一个「`Esc` 返回对话」提示条：桌面壳里 `window.open` 不建子窗口，
+    前端是把 WebView **整页导航**到本页的，页面上没有浏览器后退键，用户进得去出不来。
+    有白名单内的 `returnTo` 就 `location.replace` 回跳，否则 `history.back()`，
+    没有历史时 `window.close()`。
+
+    Esc 也能返回，但这个手势没有任何可见线索——不提示就等于不存在，所以进页面时
+    在**页面底部居中**浮一个 toast（可点 `×` 关掉、6 秒后自动收起，`sessionStorage`
+    记住本次停留已提示过）。toast 的背景/文字走 `--toast-bg` / `--toast-ink` 等
+    主题变量，浅色与深色各一套，不要写死颜色。
+
+    `?overlayChrome=1`（桌面壳按 `window.__TOILER_OVERLAY_TITLEBAR__` 传）给 `<html>`
+    挂 `overlay-chrome`：macOS 用的是覆盖式标题栏，红绿灯浮在网页内容上（距顶约 42px、
+    左侧约 76px），左侧大纲不往下让位的话第一项「会话目录」正好被按钮盖住。
+    下载形态（`attachment`）不注入任何界面元素。
+
+    `?theme=light|dark` 是**应用里已解析的主题**，前端从 `useTheme().theme` 透传。
+    导出页是独立 HTML（桌面壳里还是整页导航），拿不到应用的 React 状态；只靠
+    `@media (prefers-color-scheme)` 的话「系统深色 + 应用里选浅色」会让导出页永远黑着。
+    显式主题落成 `<html class="theme-light|theme-dark">` + `<meta name="color-scheme">`，
+    CSS 里类选择器 `html.theme-*`（权重 0,1,1）高于 media 里的 `:root`（0,1,0），因此
+    即使系统是深色也能回到浅色。不传（`auto`）或值认不出时不挂类，交由系统偏好决定。
 13. **`/api/agent/{id}/bash-output` 的会话归属校验**：pi 只认
     `role:"bashExecution"` 的顶层 `fullOutputPath`；toiler 额外接受新工具形态
     （`role:"toolResult"` 的 `details.fullOutputPath`），因为当前 pi 就是这么写的。
