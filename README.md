@@ -295,8 +295,9 @@ POST /api/agent/{id} {type:"prompt"}
 - **项目库独立**：`~/.agents/toiler/work.sqlite`（`added_projects` /
   `app_preferences`）；首次创建时从旧的 `~/.pi/agent/pi.sqlite` **只读**
   导入一次，之后两边各自独立演进。
-- **git 走 CLI**：20 个动作、worktree、diff 全部包在 `gitsvc.rs`，每个仓库一把锁；
-  凭据走临时 `GIT_ASKPASS`（不落明文到命令行）。
+- **git 走 CLI**：24 个动作、worktree、diff 全部包在 `gitsvc.rs`，每个仓库一把锁；
+  凭据走临时 `GIT_ASKPASS`（不落明文到命令行），勾了「记住」则 AES-256-GCM
+  加密存进 `configs/git-credentials.json`（密钥在 macOS 钥匙串，与 pi 共用条目）。
 - **真模型的三处调用**：`auto-name`（起标题）、`git/commit-message`（写提交信息）、
   `models-config/test`（连通性自检）都复用 `oneshot.rs` 的一次性补全。
 - **`projectRoot` 修好了**：改成真 `git rev-parse` 探测，worktree 会话会带

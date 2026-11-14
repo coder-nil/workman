@@ -488,10 +488,27 @@ pi 另有三个写侧/市场接口，toiler 都返回 `501 {"error":"…中文�
    `user/plan`、`quota/usage` 这些用量接口没移植。
 9. **`/api/auth/api-key/{provider}` 的 `displayName`** 取 `models.json` 的 `name`，缺省用 id
    （pi 取 models.dev 的展示名）。
-10. **git 凭据**：pi 用 AES-256-GCM 加密存进 `git-credentials.json`（密钥在 macOS Keychain）。
-   toiler 把凭据交给系统 credential helper（`git credential approve`），因此
-   `hasSavedCredential` / `savedCredentialUsername` 恒为 `false` / `null`；
-   「记住凭据」对后续 `git` 命令仍然生效。
+10. **git 凭据**：与 pi 同格式 —— AES-256-GCM 加密存进 `git-credentials.json`
+   （`<toilerHome>/configs/` 下），密钥是 macOS Keychain 里那条
+   `pi-desktop-git-credentials` / `encryption-key`。两边**共用同一个钥匙串条目**，
+   所以 pi 存过的密文 toiler 能直接解开，首次启动也会把它那份文件复制过来
+   （见 `paths::SEEDED_CONFIG_FILES`）；反之亦然。
+   差异：
+   - 文件位置的 `agentDir` 换成 toiler 自己的 `configs/`（数据目录改名的一部分）；
+   - 非 macOS 平台没有等价的系统密钥库，所以**不启用**加密存储（明确回「不可用」，
+     而不是退回同一目录下的一把明文密钥）。这时仍可走 git 自己的 credential
+     helper（`osxkeychain` / `manager` / `store`），只是 SSH 私钥口令无法记住。
+   - `/api/git` 的返回体多一个 `canRememberCredential: boolean`（pi 没有），
+     前端据此把「记住凭据」勾选框置灰并说明原因。
+
+   `hasSavedCredential` / `savedCredentialUsername` 现在是**真实状态**（早先是写死的
+   `false` / `null`）。这不是纯新增字段 —— 它修的是一个真问题：前端靠这两个字段
+   决定「口令框该不该被清空」，写死 `false` 就等于每次推/拉之后把刚记住的口令抹掉，
+   于是勾了「在此设备上加密记住凭据」也永远要重输。同时 `fetch` / `pull` / `push` /
+   `push_tag` / `push_tags` 在请求体不带 `credential` 时会自动取已存的那份，
+   不再依赖 credential helper（那条路对 SSH 口令无效）。
+   credential helper（`git credential approve`）**仍然写**，但只对 HTTPS：
+   它能让用户在终端里自己跑的 `git push` 也受益。
 11. **`/api/git/commit-message` 的流**：pi 每收到一段就发一行 `update`；toiler 攒完再一次
     `update` + `done`（字段相同，少了中间增量）。
 12. **`/api/sessions/{id}/export` 的 HTML**：响应头与文件名规则与 pi 一致，但内容是自己渲染的
